@@ -1,0 +1,886 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var myTable = ee.FeatureCollection("projects/datathon2023bcchile/assets/result_sdg");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+// Define the area of interest and date range once and reuse them.
+var countries = ee.FeatureCollection('FAO/GAUL/2015/level0');
+//var countries = ee.FeatureCollection('FAO/GAUL/2015/level1');
+var pais = 'Lesotho';
+var geometry = countries.filter(ee.Filter.eq('ADM0_NAME', pais)).geometry();
+var startDate = '2020-01-01';
+var endDate = '2021-01-01';
+
+var chartIndex = -1; 
+
+var startYear = 2015;
+var endYear = 2022;
+var yearSelector = 2021;
+
+// Función para actualizar el valor en el panel basado en el país y el año seleccionados
+function updateValuePanel(newPais, newYearSelector) {
+  // Filtrar la tabla por el país y el año seleccionados
+  var filteredTable = myTable.filter(ee.Filter.eq('Area', newPais))
+                             .filter(ee.Filter.eq('Year', newYearSelector));
+
+  // Obtener el valor de la tabla para mostrar en el panel
+  // Este es un proceso asincrónico, así que usamos evaluate
+  filteredTable.first().get('AG_PRD_FIESS-_T-_T-_T').evaluate(function(valor) {
+    // Actualiza el panel con el nuevo valor
+    valueLabel.setValue('Valor: ' + valor);
+  });
+}
+
+
+// Función para calcular el área total de cropland y actualizar la etiqueta UI
+function calculateAndUpdateCroplandArea(croplandMask, geometry) {
+  // Calculate total area of cropland
+  var pixelArea = ee.Image.pixelArea();
+  var croplandAreaImage = croplandMask.multiply(pixelArea);
+  var croplandArea = croplandAreaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geometry,
+    scale: 100, 
+    maxPixels: 1e9
+  });
+  var croplandAreaKm2 = croplandArea.getNumber('label_median').divide(1000000);
+  var croplandAreaKm2_rond = croplandAreaKm2.format('%.2f');
+  print('Cropland Area (km^2):', croplandAreaKm2_rond);
+  var updateLabel = function(value) {
+    value1Label.setValue(value);
+  };
+  croplandAreaKm2_rond.evaluate(updateLabel);
+  
+  // Calculate total percentage of cropland
+  var totalAreaKm2 = geometry.area().divide(1000000);
+  var croplandPercentage = croplandAreaKm2.divide(totalAreaKm2).multiply(100);
+  var croplandPercentage_rond = croplandPercentage.format('%.2f');
+  print('Cropland %:', croplandPercentage_rond);
+  var updateLabel2 = function(value) {
+    value2Label.setValue(value);
+  };
+  croplandPercentage_rond.evaluate(updateLabel2);
+}
+
+
+// Función para calcular el área de una máscara
+function calculateArea(mask, remappedClusteredImage) {
+  // Multiplica la máscara por el área de cada píxel
+  var areaImage = mask.multiply(ee.Image.pixelArea());
+
+  // Suma el área de todos los píxeles en la máscara
+  var totalArea = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: remappedClusteredImage.geometry(),
+    scale: 100,  // Asegúrate de ajustar la escala según la resolución de tu imagen
+    maxPixels: 1e9
+  });
+
+  // Convierte el área a kilómetros cuadrados y obtén el valor
+  var totalAreaKm2 = totalArea.getNumber('remapped').divide(1000000);
+  var totalAreaKm2_rond = totalAreaKm2.format('%.2f');
+  return ee.Number.parse(totalAreaKm2_rond);
+}
+
+function updatePanelWithChart(newChart) {
+  // Si ya hemos añadido un gráfico al panel antes, chartIndex debe ser diferente de -1
+  if (chartIndex !== -1) {
+    // Reemplaza el gráfico existente con el nuevo gráfico
+    panel.widgets().set(chartIndex, newChart);
+  } else {
+    // Añade el nuevo gráfico al panel y guarda su índice
+    chartIndex = panel.widgets().length(); // Obtén el índice actual al final de la lista de widgets
+    panel.widgets().add(newChart);
+  }
+}
+
+// Función para actualizar las capas según el país y año seleccionado
+function updateMap(newPais, newYearSelector) {
+  // Actualizar la geometría basada en el nuevo país seleccionado
+  var pais = newPais;
+  var filtered = countries.filter(ee.Filter.eq('ADM0_NAME', pais));
+  var geometry = filtered.geometry();
+
+  // Remover las capas existentes
+  Map.layers().reset();
+
+  // var startDate = newYearSelector + '-01-01';
+  // var endDate = (newYearSelector + 1) + '-01-01';
+  var startDate = '2020-01-01';
+  var endDate = '2021-01-01';
+  
+    
+  // Load the Dynamic World land cover and compute the composite in one step.
+  var dwComposite = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+    .filterDate(startDate, endDate)
+    .filterBounds(geometry)
+    .select('label')
+    .reduce(ee.Reducer.median())
+    .clip(geometry);
+  
+  // Create masks for croplands and other potential zones in one step.
+  var croplandMask = dwComposite.eq(4);
+  
+  // Llama a la función para calcular el área total de las tierras de cultivo
+  calculateAndUpdateCroplandArea(croplandMask, geometry);
+  
+  var potentialZonesMask = dwComposite.eq(2).or(dwComposite.eq(5)).or(dwComposite.eq(7));
+  
+  
+  // Calculate distances to cropland and non-cropland in one step.
+  var distanceToCropland = croplandMask.not().multiply(ee.Image.pixelArea()).distance({
+    kernel: ee.Kernel.euclidean(1000, 'meters'),
+    skipMasked: false
+  }).clip(geometry);
+  
+  // Load and process the SPEI dataset.
+  var speiDataset = ee.ImageCollection("CSIC/SPEI/2_8")
+    .filterDate(startDate, endDate)
+    .filterBounds(geometry);
+  var spei = speiDataset.select('SPEI_24_month');
+  var speiComposite = spei.reduce(ee.Reducer.median()).clip(geometry);
+  
+  // Load the protected areas dataset and paint it to an image for visualization.
+  var protectedAreas = ee.FeatureCollection('WCMC/WDPA/current/polygons')
+    .filterBounds(geometry);
+  var protectedAreasImage = ee.Image().float().paint(protectedAreas, 'REP_AREA').clip(geometry);
+  var binaryProtectedAreasImage = protectedAreasImage.gt(0).unmask();
+  var inverted_Protected_Areas = binaryProtectedAreasImage.not()
+  
+  // Load the Free Flowing Rivers dataset and paint it for visualization.
+  var rivers = ee.FeatureCollection('WWF/HydroSHEDS/v1/FreeFlowingRivers')
+    .filterBounds(geometry);
+  var riversImage = ee.Image().byte().paint(rivers, 'RIV_ORD', 2).clip(geometry);
+  
+  
+  // Landforms classification and potential zones mask.
+  var landforms = ee.Image('CSP/ERGo/1_0/Global/SRTM_landforms').select('constant').clip(geometry);
+  var potentialLandformsMask = landforms.updateMask(landforms.eq(31).or(landforms.eq(32).or(landforms.eq(33).or(landforms.eq(34).or(landforms.eq(41).or(landforms.eq(42))))))).eq(1).clip(geometry);
+  var potentialLandformsMask = potentialLandformsMask.not().unmask(0)
+  
+  
+  // Infraestructura critica
+  var infraInNigeria = ee.ImageCollection("projects/sat-io/open-datasets/CISI/amount_infrastructure").filterBounds(geometry);
+  
+  
+  // Convierte la colección de imágenes filtradas en una lista
+  var listOfImages = infraInNigeria.toList(infraInNigeria.size());
+  // Define los índices de las imágenes que deseas seleccionar
+  // 24 primary
+  // 25 railway
+  // 27 reservorio
+  // 28 reservorio cubierto
+  // 30 secundario
+  // 32 terciario
+  // 36 torre de agua
+  // 37 pozos de agua
+  // 38 water works
+  var selectedIndices_water = [27,28,36,37,38];
+  // Extrae las imágenes seleccionadas y las combina en una colección de imágenes
+  var selectedImages_water = ee.ImageCollection(selectedIndices_water.map(function(index) {
+    return ee.Image(listOfImages.get(index));
+  }));
+  
+  // Combina las imágenes seleccionadas en una sola imagen utilizando mosaic
+  var combinedImage_water = selectedImages_water.mosaic();
+  
+  // Añade la imagen combinada al mapa, recortada a la geometría de Nigeria
+  //Map.addLayer(combinedImage_water.clip(geometry), {min: 0, max: 1}, 'Combined Water Infrastructure Image',false);
+  
+  
+  var selectedIndices_transport = [24,25];
+  
+  // Extrae las imágenes seleccionadas y las combina en una colección de imágenes
+  var selectedImages_transport = ee.ImageCollection(selectedIndices_transport.map(function(index) {
+    return ee.Image(listOfImages.get(index));
+  }));
+  
+  // Combina las imágenes seleccionadas en una sola imagen utilizando mosaic
+  var combinedImage_transport = selectedImages_transport.mosaic();
+  
+  // Añade la imagen combinada al mapa, recortada a la geometría de Nigeria
+  //Map.addLayer(combinedImage_transport.clip(geometry), {min: 0, max: 1}, 'Combined Transport Infrastructure Image',false);
+  
+  //Para calcular distancia con infraestructura
+  var mask_water = combinedImage_water.gt(0);
+  var mask_transport = combinedImage_transport.gt(0);
+  
+  // Calculate the distance using a smaller kernel size
+  var distanceKernel = ee.Kernel.euclidean({
+    radius: 1000, // radius in meters
+    units: 'meters'
+  });
+  
+  // Calculate the distance to the nearest zero or masked pixel using the euclidean kernel
+  var distance_water = mask_water.distance({
+    kernel: distanceKernel,
+    skipMasked: false
+  });
+  
+  var distance_transport = mask_transport.distance({
+    kernel: distanceKernel,
+    skipMasked: false
+  });
+  
+  
+  // Define a maximum relevant distance for your analysis (in meters)
+  var maxRelevantDistance = 1000; // This is an example value
+  
+  // Create an ee.Image with the maximum distance value
+  var maxDistanceImage = ee.Image.constant(maxRelevantDistance);
+  
+  // Invert the logic by subtracting the calculated distance from the maximum distance image
+  var inverted_distance_water = maxDistanceImage.subtract(distance_water);
+  var inverted_distance_transport = maxDistanceImage.subtract(distance_transport);
+  
+  
+  // Convertir la máscara de agua en vectores.
+  var waterVectors = mask_water.reduceToVectors({
+    reducer: ee.Reducer.countEvery(),
+    geometry: geometry,
+    scale: 30,
+    maxPixels: 1e8
+  });
+  
+  // Calcular el centroide de cada vector y aplicar un buffer de 100 metros.
+  var bufferedCentroids = waterVectors.map(function(feature) {
+    return feature.centroid({maxError: 1}).buffer(100); // Aplicar buffer aquí
+  });
+  
+  // Añadir los centroides con buffer al mapa.
+  Map.addLayer(bufferedCentroids, {color: 'blue'}, 'Buffered Centroids of Water Infrastructure',false);
+  
+  
+  var centroidImage = bufferedCentroids.map(function(feature) {
+    // Assign a value of 1 to all features in the FeatureCollection.
+    return feature.set('constant', 1);
+  }).reduceToImage({
+    properties: ['constant'],
+    reducer: ee.Reducer.first()
+  }).unmask(0);
+  
+  
+  // Specify the distance kernel to use for the distance calculation
+  var distancia = 10000
+  var distanceKernel = ee.Kernel.euclidean({
+    radius: distancia, // The radius of the kernel to use for distance calculation
+    units: 'meters'
+  });
+  
+  // Calculate the distance from each pixel to the nearest non-zero pixel (the centroids)
+  var distanceToCentroid = centroidImage.distance({
+    kernel: distanceKernel,
+    skipMasked: true
+  });
+  
+  // Add the distance layer to the map
+  //Map.addLayer(distanceToCentroid.clip(geometry), {min: 0, max: 10000, palette: ['00FFFF', '0000FF']}, 'Distance to Buffered Centroids',false);
+  
+  
+  var maxDistanceValue = distancia; // Este valor puede ajustarse según sea necesario.
+  
+  // Calcular el inverso de la distancia utilizando distanceToCentroid.
+  var inverseDistanceToCentroid = ee.Image.constant(maxDistanceValue).subtract(distanceToCentroid).unmask(0);
+  
+  // Clip la imagen inversa con la geometría de interés.
+  var inverseDistanceToCentroidClipped = inverseDistanceToCentroid.clip(geometry);
+  
+  // Añadir la capa de distancia inversa al mapa
+  //Map.addLayer(inverseDistanceToCentroidClipped, {min: 0, max: maxDistanceValue, palette: ['00FFFF', '0000FF']}, 'Inverse Distance to Centroids',false);
+  
+  
+  
+  // Combine the visual parameters into a function for reuse.
+  function getVisParams(palette, min, max) {
+    return { palette: palette, min: min, max: max, opacity: 0.8 };
+  }
+  
+  // Add layers to the map using a function to avoid duplicating code.
+  function addLayerToMap(image, visParams, name) {
+    Map.addLayer(image, visParams, name, false);
+  }
+  
+  
+  
+  //Bio DIversity Index
+  var bdi_ic = ee.ImageCollection("projects/ebx-data/assets/earthblox/IO/BIOINTACT").filterBounds(geometry);
+  var bdi_comp = bdi_ic.filterDate(startDate, endDate).mean().clip(geometry);
+  
+  
+  var visualization = {
+    bands: ['BioIntactness'],
+    min: 0,
+    max: 1,
+    palette: ['e5f5e0', 'a1d99b', '31a354'], 4: ['edf8e9', 'bae4b3', '74c476', '238b45']
+  };
+  
+  
+  var grip4_africa = ee.FeatureCollection("projects/sat-io/open-datasets/GRIP4/Africa").filterBounds(geometry);
+  
+  var clipped_grip4_africa = grip4_africa.map(function(feature) {
+    return feature.intersection(geometry, ee.ErrorMargin(1));
+  });
+  var bufferDistance = 100;
+  var caminosConBuffer = clipped_grip4_africa.map(function(calle) {
+    return calle.buffer(bufferDistance);
+  });
+  
+  // Crear una imagen binaria donde las áreas de los caminos con buffer son 1 y el resto es 0.
+  var caminosBufferImage = caminosConBuffer.map(function(feature) {
+    // Asignar un valor de 1 a todas las entidades en la FeatureCollection.
+    return feature.set('constant', 1);
+  }).reduceToImage({
+    properties: ['constant'],
+    reducer: ee.Reducer.first()
+  }).unmask();
+  
+  
+  var distanciaACaminosBuffer = caminosBufferImage.fastDistanceTransform().sqrt().divide(ee.Image.pixelArea().sqrt());
+  //Map.addLayer(distanciaACaminosBuffer.clip(geometry), {min: 0, max: 5000, palette: ['00FF00', 'FFFF00', 'FF0000']}, 'Distancia a Caminos con Buffer',false);
+  
+  // Supongamos que ya tienes la imagen de distancia 'distanciaACaminosBuffer'.
+  
+  // Define un valor máximo para la inversión basado en un valor razonable que esperas en tu imagen.
+  var maxDistanceValue = 5000;  // Este valor puede ajustarse según sea necesario.
+  
+  // Calcular el inverso de la distancia.
+  var inversoDistancia = ee.Image.constant(maxDistanceValue).subtract(distanciaACaminosBuffer);
+  
+  // Clip la imagen inversa con la geometría de interés.
+  var inversoDistanciaClipped = inversoDistancia.clip(geometry);
+  
+  
+  //Carga Soil layers 
+  var OCS = ee.Image("projects/soilgrids-isric/ocs_mean").clip(geometry);
+  
+  //set visualization parameters
+  var imageVisParam = {"opacity":1,"bands":["ocs_0-30cm_mean"],"min":0,"max":100,"palette":["ffef29","0000ff"]};
+  
+  //add layer to the map
+  Map.addLayer(OCS.clip(geometry), imageVisParam, 'Organic carbon stocks',false)
+  
+  
+  
+  
+  
+  //Map.addLayer(inversoDistanciaClipped, {
+  //   min: 0,
+  //   max: maxDistanceValue,
+  //   palette: ['FF0000', 'FFFF00', '00FF00']
+  // }, 'Inverso de la Distancia a Caminos con Buffer',false);
+  
+  // Use the function to add layers.
+  var dwVisParams = {
+    min: 0,
+    max: 8,
+    palette: [
+      '#419BDF', '#397D49', '#88B053', '#7A87C6', '#E49635', '#DFC35A',
+      '#C4281B', '#A59B8F', '#B39FE1'
+    ]
+  };
+  var dwCropVisParams = {
+    min: 0,
+    max: 1,
+    palette: ['#A59B8F','#E49635']
+  };
+  
+  var visParams_Protected = {
+    palette: ['0000FF', 'FF0000'], // Blue for water, red for land
+    min: 0,
+    max: 1,
+    opacity: 0.5
+  };
+  
+  
+  
+  
+  // addLayerToMap(dwComposite, dwVisParams, 'DW ' + startDate);
+  //addLayerToMap(potentialZonesMask, dwVisParams, 'DW Potential Zones ' + startDate);
+  //addLayerToMap(binaryProtectedAreasImage, getVisParams(['2ed033', '5aff05', '67b9ff', '5844ff', '0a7618', '2c05ff'], 0, 1550000.0), 'Protected Areas');
+  
+  // addLayerToMap(croplandMask,dwCropVisParams, 'DW Croplands ' + startDate);
+  // addLayerToMap(distanceToCropland, {min: 0, max: 1000, palette: ['00FF00', 'FFFF00', 'FF0000']}, 'Distance to Cropland ' + startDate);
+   addLayerToMap(speiComposite, {min: -2.33, max: 2.33, palette: ['8b1a1a', 'de2929', 'f3641d', 'fdc404', '9afa94', '03f2fd', '12adf3', '1771de', '00008b']}, 'SPEI 24-month ' + startDate);
+   addLayerToMap(binaryProtectedAreasImage.clip(geometry), visParams_Protected, 'Protected Areas');
+  // addLayerToMap(riversImage, getVisParams(['08519c', '3182bd', '6baed6', 'bdd7e7', 'eff3ff'], 1, 10), 'Free Flowing Rivers');
+  // addLayerToMap(combinedImage_water.clip(geometry), {min: 0, max: 1}, 'Combined Water Infrastructure Image');
+  // addLayerToMap(combinedImage_transport.clip(geometry), {min: 0, max: 1}, 'Combined Transport Infrastructure Image');
+   //addLayerToMap(inverted_distance_water.clip(geometry), {min: 0, max: 5000, palette: ['0000FF', 'FF0000']}, 'Distance to Water Infrastructure');
+   //addLayerToMap(inverted_distance_transport.clip(geometry), {min: 0, max: 5000, palette: ['0000FF', 'FF0000']}, 'Distance to Transport Infrastructure');
+  // addLayerToMap(potentialLandformsMask, getVisParams(['blue'], 1, 1), 'Landform Potential Zones');
+  addLayerToMap(bdi_comp, visualization, "Composite Biodiversity" + startDate);
+  addLayerToMap(clipped_grip4_africa, {color: '413B3A',width:1}, "Global Roads Africa");
+  //addLayerToMap(caminosConBuffer, {color: '413B3A',width:1}, "Buffer Global Roads Africa");
+  
+  
+  //Normalización de Variables
+  
+  //Normalización Distancia a Cropland
+  var minMaxCropland = distanceToCropland.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: geometry,
+    scale: 30, // Ajusta esto a un valor apropiado para tu análisis
+    maxPixels: 1e6,
+    bestEffort: true,
+    tileScale: 16
+  });
+  
+  // Imprimir el resultado para verificar las claves disponibles
+  print('Min Max Cropland Distance', minMaxCropland);
+  var distanceToCroplandNormalized = distanceToCropland.unitScale(
+    minMaxCropland.get('label_median_min'),
+    minMaxCropland.get('label_median_max')
+  ).multiply(10000).toInt16();
+  //addLayerToMap(distanceToCroplandNormalized, {min: 0, max: 1, palette: ['00FF00', 'FFFF00', 'FF0000']}, 'Normalized Distance to Cropland');
+  
+  
+  
+  //Normalización Distancia a Water Infrastructure
+  // var minMaxWI = inverted_distance_water.reduceRegion({
+  //   reducer: ee.Reducer.minMax(),
+  //   geometry: geometry,
+  //   scale: 30, // Ajusta esto a un valor apropiado para tu análisis
+  //   maxPixels: 1e6,
+  //   bestEffort: true,
+  //   tileScale: 16
+  // });
+  // print('Min Max Water Infrastructure Distance',minMaxWI);
+  
+  // var distanceToWINormalized = inverted_distance_water.unitScale(
+  //   minMaxWI.get('constant_min'),
+  //   minMaxWI.get('constant_max')
+  // ).multiply(10000).toInt16();
+  //addLayerToMap(distanceToWINormalized.clip(geometry), {min: 0, max: 1, palette: ['00FF00', 'FFFF00', 'FF0000']}, 'Normalized Distance to Water Infrastructure');
+  
+  //Normalización Distancia a Transport Infrastructure
+  // var minMaxTransport = inverted_distance_transport.reduceRegion({
+  //   reducer: ee.Reducer.minMax(),
+  //   geometry: geometry,
+  //   scale: 30, // Ajusta esto a un valor apropiado para tu análisis
+  //   maxPixels: 1e6,
+  //   bestEffort: true,
+  //   tileScale: 16
+  // });
+  // print('Min Max Transport Infrastructure Distance',minMaxTransport);
+  
+  // var distanceToTransportNormalized = inverted_distance_transport.unitScale(
+  //   minMaxTransport.get('constant_min'),
+  //   minMaxTransport.get('constant_max')
+  // ).multiply(10000).toInt16();
+  //addLayerToMap(distanceToTransportNormalized.clip(geometry), {min: 0, max: 1, palette: ['00FF00', 'FFFF00', 'FF0000']}, 'Normalized Distance to Transport Infrastructure');
+  
+  
+  //Normalización SPEI 
+  var speiComposite_abs = speiComposite.abs();
+  var minMax_spei = speiComposite_abs.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: geometry,
+    scale: 30, // Ajusta esto a un valor apropiado para tu análisis
+    maxPixels: 1e6,
+    bestEffort: true,
+    tileScale: 8
+  });
+  print('Min Max SPEI',minMax_spei);
+  
+  var speiNormalized = speiComposite_abs.unitScale(
+    minMax_spei.get('SPEI_24_month_median_min'),
+    minMax_spei.get('SPEI_24_month_median_max')
+  ).multiply(10000).toInt16();
+  //addLayerToMap(speiNormalized.clip(geometry), {min: 0, max: 1, palette: ['00FF00', 'FFFF00', 'FF0000']}, 'Normalized SPEI');
+  
+  var speiComposite_abs = speiComposite.abs();
+  var minMax_spei = speiComposite_abs.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: geometry,
+    scale: 30, // Ajusta esto a un valor apropiado para tu análisis
+    maxPixels: 1e6,
+    bestEffort: true,
+    tileScale: 8
+  });
+  
+  
+  //Normalización BioDiversidad
+  
+  // var minMax_bdi_comp = bdi_comp.reduceRegion({
+  //   reducer: ee.Reducer.minMax(),
+  //   geometry: geometry,
+  //   scale: 30, // Ajusta esto a un valor apropiado para tu análisis
+  //   maxPixels: 1e6,
+  //   bestEffort: true,
+  //   tileScale: 8
+  // });
+  // print('Min Max BDI',minMax_bdi_comp);
+  
+  // Asume que bdi_comp_normalized tiene 0 bandas y necesitas agregarle una
+  var constantBand = ee.Image.constant(1); // Crea una imagen constante
+  
+  // Agrega la imagen constante como una nueva banda a bdi_comp_normalized
+  var bdi_comp2 = bdi_comp.addBands(constantBand);
+  
+  var bdi_comp_normalized = bdi_comp2.unitScale(
+   0,
+   1
+  ).multiply(10000).toInt16();
+  
+  var bdi_comp_inverted = bdi_comp_normalized.multiply(-1).add(10000);
+  //addLayerToMap(bdi_comp_inverted.clip(geometry), {min: 0, max: 1, palette: ['00FF00', 'FFFF00', 'FF0000']}, 'bdi_comp_inverted');
+  
+  
+  
+  //Normalización Distancia a Caminos Africa (Bufer) 
+  var minMaxRoads = inversoDistanciaClipped.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: geometry,
+    scale: 30, // Ajusta esto a un valor apropiado para tu análisis
+    maxPixels: 1e6,
+    bestEffort: true,
+    tileScale: 16
+  });
+  print('Min Max Roads Distance',minMaxRoads);
+  
+  var distanceToRoadsNormalized = inversoDistanciaClipped.unitScale(
+    minMaxRoads.get('constant_min'),
+    minMaxRoads.get('constant_max')
+  ).multiply(10000).toInt16();
+  //addLayerToMap(distanceToTransportNormalized.clip(geometry), {min: 0, max: 1, palette: ['00FF00', 'FFFF00', 'FF0000']}, 'Normalized Distance to Transport Infrastructure');
+  
+  //Normalización Distancia a Infrestructura Agua (Bufer) 
+  var minMaxWaterBufer = inverseDistanceToCentroid.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: geometry,
+    scale: 30, // Ajusta esto a un valor apropiado para tu análisis
+    maxPixels: 1e6,
+    bestEffort: true,
+    tileScale: 16
+  });
+  print('Min Max WaterBufer',minMaxWaterBufer);
+  
+  var distanceWaterBuferNormalized = inverseDistanceToCentroid.unitScale(
+    0,
+    10000
+  ).multiply(10000).toInt16();
+  
+  
+  var combinedMask = potentialZonesMask.updateMask(inverted_Protected_Areas).updateMask(potentialLandformsMask);
+  
+  
+  addLayerToMap(combinedMask, dwVisParams, 'DW Potential Zones' + startDate);
+  
+  
+  //Normalización OCS
+  // var minMaxOCS = OCS.reduceRegion({
+  //   reducer: ee.Reducer.minMax(),
+  //   geometry: geometry,
+  //   scale: 30, // Ajusta esto a un valor apropiado para tu análisis
+  //   maxPixels: 1e6,
+  //   bestEffort: true,
+  //   tileScale: 16
+  // });
+  // print('Min Max OCS',minMaxRoads);
+  
+  var OCSNormalized = OCS.unitScale(
+    0,
+    150
+  ).multiply(10000).toInt16();
+  
+  
+  
+  
+  //Creación PILA
+  var PILA = distanceToCroplandNormalized.unmask(0)
+              .addBands(bdi_comp_inverted).unmask()
+              .addBands(speiNormalized).unmask(0)
+              .addBands(distanceToRoadsNormalized).unmask(0)
+              .addBands(OCSNormalized).unmask(0)
+              .addBands(distanceWaterBuferNormalized).unmask(0).updateMask(combinedMask);
+
+  
+  // Creación aleatoria de puntos de entrenamiento
+  var training = PILA.sample({
+    region: geometry,
+    scale: 100,
+    numPixels: 1000,
+    seed: 0, // Puedes especificar una semilla para la aleatoriedad si es necesario
+    dropNulls: true, // Puedes especificar si deseas descartar los nulos
+    tileScale: 1
+  });
+  
+  // Iniciación y entrenamiento del cluster KMEANS Canopy
+    var clusterer = ee.Clusterer.wekaKMeans({
+      nClusters: 6,
+      init: 1,
+      canopies: true, 
+      fast: true,
+      //distanceFunction: 'euclidean'
+    }).train(training);
+  
+  // Cluster the input using the trained clusterer.
+    var result = PILA.cluster(clusterer).toUint8();
+    
+   // Map.addLayer(result.randomVisualizer(), {}, 'clusters');
+  
+  
+  // Calcula la media de las bandas
+  var meanBand = PILA.reduce(ee.Reducer.mean());
+  
+  
+  var medias = meanBand.addBands(result);
+  
+  // Grouped a mean reducer: change of nightlights by land cover category.
+  var means = medias.reduceRegion({
+    reducer: ee.Reducer.mean().group({
+      groupField: 1,
+      groupName: 'code',
+    }),
+    geometry: geometry,
+    scale: 1000,
+    maxPixels: 1e8
+  });
+  
+  
+  var means_evaluado  = means.getInfo();
+  
+  var groups = means_evaluado.groups;
+  
+  // Use map to transform the 'groups' array into a list of 'mean' values
+  var meanList = groups.map(function(group) {
+    return group.mean; // Replace 'mean' with the field name you want to list
+  });
+  
+  var meanListWithIndex = groups.map(function(group, index) {
+    return {index: index, mean: group.mean};
+  });
+  
+  // Sort the new array by the mean value, providing a compare function
+  var sortedMeanListWithIndex = meanListWithIndex.sort(function(a, b) {
+    return a.mean - b.mean; // This will sort the array in ascending order
+  });
+  
+  // Now, sortedMeanListWithIndex is an array of objects sorted by the 'mean' value
+  console.log(sortedMeanListWithIndex);
+  
+  
+  
+  var toList = sortedMeanListWithIndex.map(function(item) {
+    return item.index;
+  });
+  console.log(toList);
+  
+  
+  
+  var originalValues = ee.List.sequence(0, 4); 
+  // La nueva lista de valores a los que quieres remapear los clústeres
+  var newValues = ee.List(toList);
+  
+  // Aplicar el remap
+  var remappedClusteredImage = result.remap(originalValues, newValues, 0);
+  
+  
+  var mask0 = remappedClusteredImage.eq(0).selfMask();
+  var mask1 = remappedClusteredImage.eq(1).selfMask();
+  var mask2 = remappedClusteredImage.eq(2).selfMask();
+  var mask3 = remappedClusteredImage.eq(3).selfMask();
+  var mask4 = remappedClusteredImage.eq(4).selfMask();
+  
+  
+  
+  
+  
+  // Definir los parámetros de visualización, incluyendo la paleta
+  
+  Map.addLayer(remappedClusteredImage, {min: 0, max: 4, palette: ['red', 'orange', 'yellow', '8DC741', '019445']}, 'Remapped Clusters',false);
+  Map.addLayer(mask0, {palette: ['red']}, 'Category 1: Limited Potential');
+  Map.addLayer(mask1, {palette: ['orange']}, 'Category 2: Improvable Potential');
+  Map.addLayer(mask2, {palette: ['yellow']}, 'Category 3: Neutral Potential');
+  Map.addLayer(mask3, {palette: ['8DC741']}, 'Category 4: Favorable Potential');
+  Map.addLayer(mask4, {palette: ['019445']}, 'Category 5: Optimal Potential');
+  
+  
+  
+  
+  // Calcula las áreas para las máscaras actualizadas.
+  var area0 = calculateArea(mask0, remappedClusteredImage);
+  var area1 = calculateArea(mask1, remappedClusteredImage);
+  var area2 = calculateArea(mask2, remappedClusteredImage);
+  var area3 = calculateArea(mask3, remappedClusteredImage);
+  var area4 = calculateArea(mask4, remappedClusteredImage);
+
+  // Crea una tabla con las áreas y los data_types actualizados.
+  // var table = ee.FeatureCollection([
+  //   ee.Feature(null, {data_type: '1: Limited Potential', area: area0}),
+  //   ee.Feature(null, {data_type: '2: Improvable Potential', area: area1}),
+  //   ee.Feature(null, {data_type: '3: Neutral Potential', area: area2}),
+  //   ee.Feature(null, {data_type: '4: Favorable Potential', area: area3}),
+  //   ee.Feature(null, {data_type: '5: Optimal Potential', area: area4}),
+  // ]);
+  
+
+  
+  
+  
+  
+  
+  // Crea una característica única con una columna para cada área de data_type.
+  var table = ee.FeatureCollection([
+    ee.Feature(null, {'Category': 'Limited Potential', 'Area1': area0}),
+    ee.Feature(null, {'Category': 'Improvable Potential', 'Area2': area1}),
+    ee.Feature(null, {'Category': 'Neutral Potential', 'Area3': area2}),
+    ee.Feature(null, {'Category': 'Favorable Potential', 'Area4': area3}),
+    ee.Feature(null, {'Category': 'Optimal Potential', 'Area5': area4}),
+  ]);
+  
+  // Define las opciones del gráfico.
+  var chartOptions = {
+    title: 'Area by Category',
+    hAxis: {title: 'Area (km^2)'},
+    vAxis: {title: 'Category'},
+    bar: {groupWidth: '100%'},
+    // Define un color para cada categoría
+    colors: ['red', 'orange', 'yellow', '8DC741', '019445'],
+    legend: { position: 'none' },
+    width: 400,
+    height: 350
+  };
+  
+  // Crea un gráfico de barras con los datos actualizados.
+  var chart = ui.Chart.feature.byFeature(table, 'Category', ['Area1','Area2','Area3','Area4','Area5'])
+    .setChartType('BarChart')
+    .setOptions(chartOptions);
+  
+  
+  updatePanelWithChart(chart);
+  
+  
+  // Centra el mapa en Pais con un zoom de nivel 6
+  Map.centerObject(geometry, 8);
+  
+}
+
+//// PANEL ////
+
+// Crea una etiqueta de título para el panel
+var titleLabel = ui.Label({
+  value: 'Potential Crop Zone Classifier',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '24px',
+    margin: '10px 0 10px 0',
+    textAlign: 'center',
+    stretch: 'horizontal'
+  }
+});
+
+var titleSelector = ui.Label({
+  value: 'Select country and year of analysis',
+  style: {
+    fontSize: '12px',
+    margin: '10px 0 10px 0',
+    textAlign: 'center',
+    stretch: 'horizontal'
+  }
+});
+
+// Crear el panel de selección de país
+var countrySelector = ui.Select({
+  items: [
+    'Lesotho', 'Togo'
+  ],
+  value: 'Lesotho',
+  onChange: function(newPais) {
+    updateMap(newPais, 2021);
+  }
+});
+
+// Crear el panel de selección de año
+var yearSelectorDropdown = ui.Select({
+  items: ee.List.sequence(startYear, endYear).getInfo().map(function(year){ return year.toString(); }),
+  value: yearSelector.toString(),
+  onChange: function(newYear) {
+    yearSelector = parseInt(newYear);
+    updateMap(pais, yearSelector);
+  }
+});
+
+// Estilo para los selectores
+var selectorStyle = {
+  width: '200px',
+  margin: '0 auto 8px auto'  // Esto centrará los selectores en el panel.
+};
+
+// Aplicar el estilo a los selectores
+countrySelector.style().set(selectorStyle);
+yearSelectorDropdown.style().set(selectorStyle);
+
+// Crear un panel para los selectores en disposición horizontal
+var selectorsPanel = ui.Panel({
+  widgets: [countrySelector, yearSelectorDropdown],
+  layout: ui.Panel.Layout.flow('horizontal'),
+  style: {
+    stretch: 'horizontal', // Estira el panel horizontalmente
+    padding: '10px'
+  }
+});
+
+
+
+
+// Estilo para el texto del título y el valor dentro del panel de indicadores
+var textStyle = {
+  textAlign: 'center', // Centra el texto horizontalmente
+  stretch: 'horizontal' // Estira el widget de texto para ocupar todo el ancho disponible del panel
+};
+
+// Crea etiquetas para los títulos y valores con el estilo de texto
+var titleValor1 = ui.Label('Cropland Area (km^2)', textStyle);
+var value1Label = ui.Label('0', textStyle); // Asumiendo que empiezas con un valor predeterminado
+
+var titleValor2 = ui.Label('Cropland %', textStyle);
+var value2Label = ui.Label('0', textStyle); // Asumiendo que empiezas con un valor predeterminado
+
+// Estilo para los paneles de indicadores individuales
+var indicatorStyle = {
+  padding: '10px',
+  color: 'black',
+  border: '1px solid black',
+  margin: '0 auto', // Auto ajustará los márgenes para centrar
+  textAlign: 'center',
+  width: '200px' // Asegúrate de que ambos paneles de indicadores tienen el mismo ancho
+};
+
+// Crea paneles para los indicadores
+var indicatorPanel1 = ui.Panel([titleValor1, value1Label], null, indicatorStyle);
+var indicatorPanel2 = ui.Panel([titleValor2, value2Label], null, indicatorStyle);
+
+// Crea el panel principal para los indicadores y los añade
+var indicatorsPanel = ui.Panel({
+  widgets: [indicatorPanel1, indicatorPanel2],
+  layout: ui.Panel.Layout.flow('horizontal'),
+  style: {stretch: 'horizontal'}
+});
+
+// Etiqueta para mostrar el valor de la tabla
+var valueLabel = ui.Label('');
+
+
+
+// Añadir widgets al panel
+var panel = ui.Panel({
+  widgets: [
+    titleLabel,
+    titleSelector,
+    selectorsPanel,
+    indicatorsPanel
+    ],
+  style: {
+    position: 'top-right',
+    padding: '8px',
+    width: '40%'
+  },
+  layout: ui.Panel.Layout.flow('vertical')
+});
+
+// Inicializar el valor y el mapa
+updateMap(pais, yearSelector);
+updateValuePanel(pais, yearSelector);
+
+// Añadir el panel al mapa
+ui.root.add(panel);
+
